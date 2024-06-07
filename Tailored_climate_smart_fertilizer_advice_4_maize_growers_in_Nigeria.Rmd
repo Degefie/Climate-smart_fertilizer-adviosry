@@ -1,0 +1,743 @@
+---
+title: "Tailored and climate smart fertilizer advice for maize growers in Nigeria"
+author: "Degefie Tibebe"
+date: "6/2/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### 1. install and Load required packages
+
+```{r, message=FALSE}
+#install & load packages
+  packages_required <- c("terra", "tidyverse", "sf", "spData","ggspatial","lubridate", "plyr","geodata","klippy","rosm", "prettymapr","plyr","reader", "writexl")
+
+#check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  invisible(lapply(packages_required, library, character.only = TRUE))
+```
+
+```{r}
+rm(list = ls())
+```
+
+```{r klippy, echo = FALSE, include = TRUE}
+klippy::klippy(position = c('top', 'right'), color = 'darkred', tooltip_message = 'Click to copy', tooltip_success = 'Done')
+```
+
+
+### 2.Structure of the data 
+```{r}
+pathIn_trial <- "~/Ferilizer_prediction/dataops/datasourcing/data/Nigeria/input/field_data"
+df <- read_csv(paste(pathIn_trial,"carob_fertilizer-cc.csv", sep = "/"))
+```
+Filter maize crop from that data
+```{r}
+maize <-df[df$crop == 'maize', ]
+```
+
+See the dimensions of the data
+```{r}
+dim(maize)
+```
+View columns of the data
+```{r}
+colnames(maize)
+```
+See the structure of the data
+```{r}
+str(maize)
+```
+
+See some observations of the whole dataset
+```{r}
+head(maize,3)
+```
+
+Let's check the number of NA values in each column
+```{r}
+maize |>
+  summarise_all(~sum(is.na(.)))
+```
+
+
+
+### 3. Check spatial locations of observations
+```{r, message=FALSE}
+NGA <- geodata::gadm(path = ".", "NGA", level = 0)
+class(NGA)
+```
+create unique Id and extract experiment year
+```{r}
+num_rows = nrow(maize)
+unique_id <- c(1:num_rows)
+maize <- cbind(unique_id , maize)
+maize$date <-as.numeric(stringr::str_match_all(maize$planting_date, "(?<!\\d)\\d{4}(?!\\d)"))
+```
+Remove rows having NA in main fields (e.g date, yield, N_rate,P_rate, K_rate)
+```{r}
+
+df<-df %>% drop_na(yield, date, longitude, latitude, N_fertilizer, P_fertilizer, K_fertilizer )
+
+```
+Identify points that lie outside of Nigeria
+```{r, message=FALSE}
+maize_pts <- terra::vect(maize, geom = c('longitude', 'latitude'), crs = ("epsg:4326"))
+plot(NGA, main = "Spatial Distribution of maize points")
+plot(maize_pts, col = 'lightgreen', cex = 0.7, add = T)
+```
+
+Select those points that lie outside of the boundary and flag the observations. 
+
+```{r}
+pts_relate <- terra::relate(NGA, maize_pts, "disjoint") |> which()
+flag1 <- dplyr::filter(maize, unique_id %in% pts_relate)
+flag1
+```
+
+Let's add a comment column for the flagged data specifying the reason for flag.
+
+```{r}
+flag1$comment <- "geolocation error"
+flag1$description <- "Outside of the boundary of Nigeria"
+flag1
+```
+
+Now let's filter out the data outside of the Nigeria boundary (Now we have 6322 observations for Nigeria)
+```{r}
+maize_filtered <- maize |> dplyr::filter(!(unique_id %in% flag1$unique_id))
+dim(maize_filtered)
+```
+
+### 4. Summarize data
+Now let's join the filtered data points by regional spatial data
+```{r}
+NGA_reg <- geodata::gadm(path = ".", "NGA", level = 1) |> st_as_sf()
+class(NGA_reg)
+maize_pts <- terra::vect(maize_filtered, geom = c('longitude', 'latitude'), crs = "epsg:4326") |> st_as_sf()
+dim(maize_pts)
+pts_joined = st_join(NGA_reg, maize_pts)
+head(pts_joined,3)
+```
+
+
+Let's compare the observations that contained by each region
+```{r fig.width=10}
+pts_joined |> ggplot(aes(NAME_1))+
+  geom_bar(fill = "lightblue")+
+  xlab("region")+
+  ylab("observation")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12))
+```
+
+Average yield per region
+```{r}
+ggplot(pts_joined, aes(NAME_1, yield)) +
+geom_bar(position='dodge', stat='summary', fun='mean', fill = "lightblue")+
+  xlab("region")+
+  ylab("mean grain yield")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+```
+
+View the summary of the numeric variables (i.e. n,p,k,grain_yield)
+```{r}
+my_list <- list(
+  42, 46, 48, 49
+   )
+
+for (element in my_list) {
+  message(colnames(maize_filtered)[element])
+  print(summary(maize_filtered[,element]))
+}
+
+```
+
+Let's check by source
+```{r}
+pts_source <- dplyr::count(as_tibble(maize_filtered), dataset_id) |> dplyr::arrange(desc(n))
+pts_source
+```
+
+Unique treatments 
+```{r}
+length(unique(maize_filtered$treatment))
+unique(maize_filtered$treatment)
+```
+
+
+###5. Identify outliers in the dataset
+
+Lets create a combination of unique values of npk for each treatment with creating an interval for npk values  
+```{r}
+maize_filtered <- maize_filtered |> dplyr::mutate(n_rate2 = round_any(N_fertilizer, 5), p_rate2 = round_any(P_fertilizer, 10), k_rate2 = round_any(K_fertilizer, 5))
+maize_filtered$treatment2 <- paste(maize_filtered$n_rate2, maize_filtered$p_rate2, maize_filtered$k_rate2, sep = "_")
+length(unique(maize_filtered$treatment2))
+unique(maize_filtered$treatment2)
+```
+
+Let's select those observations with yield greater than 6ton/ha (outliers)
+```{r}
+flag2 <- maize_filtered |> dplyr::filter(yield > 6000)
+flag2$comment <- "outlier"
+flag2$description <- "grain yield greater than 6t/ha"
+dim(flag2)
+```
+Let's see the above outliers by source, treatment and year
+```{r}
+flag2 |> dplyr::group_by(dataset_id, treatment2) |>
+  dplyr::summarize(n = n()) |> dplyr::arrange(desc(n))
+
+```
+
+flag2 for n ommision
+```{r}
+flag2 |> dplyr::filter(n_rate2 == 0 & p_rate2 != 0 & k_rate2 != 0) |> 
+  dplyr::group_by(dataset_id, treatment2) |>
+  dplyr::summarize(n = n()) |> dplyr::arrange(desc(n))
+```
+
+flag2 for p ommision
+```{r}
+flag2 |> dplyr::filter(n_rate2 != 0 & p_rate2 == 0 & k_rate2 != 0) |> 
+  dplyr::group_by(dataset_id, treatment2) |>
+  dplyr::summarize(n = n()) |> dplyr::arrange(desc(n))
+```
+
+flag2 for k ommision
+```{r}
+flag2_k_om <- flag2 |> dplyr::filter(n_rate2 != 0 & p_rate2 != 0 & k_rate2 == 0) 
+dim(flag2_k_om)
+flag2_k_om|> 
+  dplyr::group_by(dataset_id) |>
+  dplyr::summarize(n = n()) |> dplyr::arrange(desc(n)) 
+```
+
+
+Let's plot k_om treatment by year and source
+```{r, fig.height=10, fig.width=10}
+flag2_k_om |>
+  ggplot(aes(x = as.factor(date), fill = dataset_id))+
+  geom_bar()+
+  xlab("year")+
+  ylab("observation")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12))
+```
+
+flag2 for control
+```{r}
+flag2_control <- flag2 |> dplyr::filter(n_rate2 == 0 & p_rate2 == 0 & k_rate2 == 0) 
+dim(flag2_control)
+flag2_control|> 
+  dplyr::group_by(dataset_id) |>
+  dplyr::summarize(n = n()) |> dplyr::arrange(desc(n)) 
+```
+
+flag2 for npk
+```{r}
+flag2_npk <- flag2 |> dplyr::filter(n_rate2 != 0 & p_rate2 != 0 & k_rate2 != 0)
+dim(flag2_npk)
+flag2_npk |>dplyr::group_by(dataset_id) |>
+  dplyr::summarize(n = n()) |> dplyr::arrange(desc(n))
+```
+
+Let's plot npk treatment by year and source
+```{r, fig.height=10, fig.width=10}
+flag2_npk |>
+  ggplot(aes(x = as.factor(date), fill = dataset_id))+
+  geom_bar()+
+  xlab("year")+
+  ylab("observation")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12))
+```
+
+Now let's filter the above outliers and check the dataset
+```{r}
+maize_filtered <- maize_filtered |> dplyr::filter(!(unique_id %in% flag2$unique_id))
+dim(maize_filtered)
+```
+
+View the summary of the numeric variables (i.e. n,p,k,grain_yield)
+```{r}
+my_list <- list(
+  42, 46, 48, 49
+   )
+
+for (element in my_list) {
+  message(colnames(maize_filtered)[element])
+  print(summary(maize_filtered[,element]))
+}
+```
+
+Let's check the total number of points by each unique combination of npk 
+
+```{r}
+pts_treatment <- dplyr::count(as_tibble(maize_filtered), treatment2) |> dplyr::arrange(desc(n))
+pts_treatment
+```
+
+Now let's flag those unique treatment combinations with less than 3 observations
+```{r}
+filt_trt <- pts_treatment |> dplyr::filter(n < 3)
+valid_set <- maize_filtered |> dplyr::filter((treatment2 %in% filt_trt$treatment2))
+maize_filtered <- maize_filtered |> dplyr::filter(!(treatment2 %in% filt_trt$treatment2))
+dim(valid_set)
+dim(maize_filtered)
+length(unique(maize_filtered$treatment2))
+```
+
+The unique combination of treatments have reduced from 182 to 156. 26 unique treatments are tested only once or twice. Now let's check by treatment and source.
+```{r}
+pts_treatsrc = maize_filtered |>
+  dplyr::group_by(dataset_id, treatment2) |>
+  dplyr::summarise(n = n()) |>
+  dplyr::arrange(desc(n))
+pts_treatsrc
+```
+
+Lets flag those treatments with few observations
+```{r}
+flag3 <- valid_set
+flag3$comment <- "few observation as per treatment"
+flag3$description <- "these dataset can be used as a validation set"
+```
+
+summarize data collected in different year
+```{r  warning=FALSE, fig.width=10}
+maize_filtered |> ggplot(aes(date))+
+  geom_bar(fill = "lightblue")+
+  xlab("year")+
+  ylab("observation")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12))
+```
+
+
+
+Now lets select those few number of observations (less than 20) by year
+```{r}
+summary_year <- maize_filtered |>
+  dplyr::group_by(date) |>
+  dplyr::summarise(n = n())
+summary_year <- summary_year |> dplyr::filter(n < 5)
+summary_year_few <- maize_filtered |> dplyr::filter(date %in% summary_year$date)
+summary_year_few |> dplyr::group_by(date) |> dplyr::summarize(n = n()) |>dplyr::arrange(desc(n))
+#print(summary_year[order(summary_year$n, decreasing = F), ])
+```
+
+Now lets plot the treatments.
+```{r, fig.height = 5}
+summary_year_few |> ggplot(aes(date, fill = dataset_id))+
+  geom_bar()+
+  xlab("year")+
+  ylab("observation")+
+  facet_wrap(~treatment2, ncol = 4)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+Now lets see the yield distribution of these treatments
+n_rate
+```{r fig.width= 8}
+summary_year_few |> 
+  ggplot(aes(n_rate2, yield, color = as.factor(date)))+
+  geom_point(size = 3)+
+  xlab("n_rate")+
+  ylab("yield")+
+  facet_wrap(~treatment2)+
+  theme_bw() 
+```
+
+p_rate
+```{r fig.width = 8}
+summary_year_few |> 
+  ggplot(aes(p_rate2, yield, color = as.factor(date)))+
+  geom_point(size = 3)+
+  xlab("p_rate")+
+  ylab("yield")+
+  facet_wrap(~treatment2)+
+  theme_bw()
+```
+
+k_rate
+```{r fig.width = 8}
+summary_year_few |> 
+  ggplot(aes(k_rate2, yield, color = as.factor(date)))+
+  geom_point(size = 3)+
+  xlab("k_rate")+
+  ylab("yield")+
+  facet_wrap(~treatment2)+
+  theme_bw()
+```
+
+Yield distribution by year
+```{r fig.width = 8}
+summary_year_few |> 
+  ggplot(aes(date, yield))+
+  geom_point(size = 3)+
+  xlab("year")+
+  ylab("yield")+
+  facet_wrap(~treatment2)+
+  theme_bw()
+```
+Yield distribution by source
+```{r fig.width = 8}
+summary_year_few |> 
+  ggplot(aes(dataset_id, yield, color = as.factor(date)))+
+  geom_point(size = 3)+
+  xlab("source")+
+  ylab("yield")+
+  facet_wrap(~treatment2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+Lets flag these few observations 
+```{r}
+flag4 <- summary_year_few
+flag4$comment <- "few observations"
+flag4$description <- "few observations in different years (less than 10)"
+```
+
+Now let's group the flagged data above by source
+```{r}
+flag4_srs <- flag4 |> dplyr::group_by(dataset_id) |>
+  dplyr::summarise(n = n())
+flag4_srs
+```
+
+Lets remove the few data above and see the distribution of data in the other years
+```{r}
+maize_filtered <- maize_filtered |> 
+  dplyr::filter(!(unique_id %in% summary_year_few$unique_id))
+dim(maize_filtered)
+```
+
+Let's plot the filtered data to see outliers (n ~ yield)
+```{r}
+maize_filtered |> ggplot(aes(n_rate2, yield))+
+  geom_point()+
+  xlab("n_rate")+
+  ylab("yield")+
+  theme_bw()
+```
+
+Let's plot these data to see outliers (p ~ yield)
+```{r}
+maize_filtered |> ggplot(aes(p_rate2, yield))+
+  geom_point()+
+  xlab("p_rate")+
+  ylab("yield")+
+  theme_bw()
+```
+
+lets plot these data to see outliers (k ~ yield)
+```{r}
+maize_filtered |> ggplot(aes(k_rate2, yield))+
+  geom_point()+
+  xlab("k_rate")+
+  ylab("yield")+
+  geom_abline(intercept = 15000, color = 'red')+
+  theme_bw()
+```
+
+Besides lets flag the yield values below 300kg/ha in the assumption that these yield values are very low interms of profitability.
+```{r}
+flag5 <- maize_filtered |> filter(yield < 300)
+flag5$comment <- "yield outliers"
+flag5$description <- "grain yield less than 300 kg/ha"
+dim(flag5)
+```
+Let's see the distribution of lower yield values.
+```{r}
+flag5_srs <- flag5 |> dplyr::group_by(dataset_id, treatment2, date) |> dplyr::summarise(n = n()) |> dplyr::arrange(desc(n))
+flag5_srs
+```
+
+Now lets remove the above outliers from the data 
+```{r}
+maize_filtered <- maize_filtered |> dplyr::filter(!(unique_id %in% flag5$unique_id))
+dim(maize_filtered)
+```
+
+View the summary of the numeric variables for the filtered data (i.e. n,p,k,grain_yield)
+```{r}
+my_list <- list(
+  42, 46, 48, 49
+   )
+
+for (element in my_list) {
+  message(colnames(maize_filtered)[element])
+  print(summary(maize_filtered[,element]))
+}
+```
+
+Now let's see the yield distribution by treatment by
+creating n_omission, p_omission, k omission trials, control and npk trials.
+1. n omission
+```{r}
+n_om <- maize_filtered |> dplyr::filter(n_rate2 == 0 & p_rate2 != 0 & k_rate2 != 0)
+dim(n_om)
+```
+Let's see unique n ommision trials as per treatment
+```{r}
+unique(n_om$treatment2)
+```
+2. p omission
+```{r}
+p_om <- maize_filtered |> dplyr::filter(n_rate2 != 0 & p_rate2 == 0 & k_rate2 != 0)
+dim(p_om)
+unique(p_om$treatment2)
+```
+Let's see unique n ommision trials as per year
+```{r}
+unique(p_om$date)
+```
+Lets summarize the p-omission
+```{r}
+p_om|> dplyr::group_by(treatment2) |> dplyr::summarise(n = n()) |> dplyr::arrange(desc(n))
+```
+
+Lets see the p-omission by source
+```{r}
+p_om|> dplyr::group_by(dataset_id, treatment2) |> dplyr::summarise(n = n()) |> dplyr::arrange(desc(n))
+```
+
+```{r fig.width = 8, fig.height = 6}
+ p_om |> 
+  ggplot(aes(x= as.factor(date), y = yield, fill = factor(dataset_id)))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 7), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 2))
+```
+3. k omission
+```{r}
+k_om <- maize_filtered |> dplyr::filter(n_rate2 != 0 & p_rate2 != 0 & k_rate2 == 0)
+dim(k_om)
+unique(k_om$treatment2)
+```
+Let's see unique n ommision trials as per year
+```{r}
+unique(k_om$date)
+```
+Lets summarize the k-omission
+```{r}
+k_om|> dplyr::group_by(treatment2) |> dplyr::summarise(n = n()) |> dplyr::arrange(desc(n))
+```
+
+Lets see the k-omission by source
+```{r}
+k_om|> dplyr::group_by(dataset_id, treatment2) |> dplyr::summarise(n = n()) |> dplyr::arrange(dataset_id)
+```
+
+```{r fig.width = 8}
+ k_om |> dplyr::filter(n_rate2 < 45) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+
+```{r fig.width = 8, fig.height=8}
+ k_om |> dplyr::filter(n_rate2 >= 45 & n_rate2 <= 70) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+```{r fig.width = 8, fig.height=8}
+ k_om |> dplyr::filter(n_rate2 > 70 & n_rate2 <= 120) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = factor(dataset_id)))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+```{r fig.width = 8, fig.height=8}
+ k_om |> dplyr::filter(n_rate2 > 120 & n_rate2 <= 200) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = factor(dataset_id)))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+4. control
+```{r}
+control <- maize_filtered |> dplyr::filter(n_rate2 == 0 & p_rate2 == 0 & k_rate2 == 0)
+dim(control)
+unique(control$treatment2)
+```
+Lets see the control by source
+```{r}
+control |> dplyr::group_by(dataset_id, treatment2) |> dplyr::summarise(n = n()) |> dplyr::arrange(desc(n))
+```
+Control
+```{r fig.width = 7}
+ control |> 
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+4. npk
+```{r}
+npk <- maize_filtered |> dplyr::filter(n_rate2 != 0 & p_rate2 != 0 & k_rate2 != 0)
+dim(npk)
+unique(npk$treatment2) 
+```
+```{r fig.width = 8, fig.height=10}
+npk |> dplyr::filter(n_rate2 < 45) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+```{r fig.width = 8, fig.height=8, fig.height=10}
+ npk |> dplyr::filter(n_rate2 >= 45 & n_rate2 <= 70) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+```{r fig.width = 8, fig.height=8, fig.height=12}
+npk |> dplyr::filter(n_rate2 > 70 & n_rate2 <= 90) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 4))
+```
+
+```{r fig.width = 8, fig.height=8}
+ npk |> dplyr::filter(n_rate2 > 90 & n_rate2 < 140) |>
+  ggplot(aes(x= as.factor(date), y = yield, fill = dataset_id))+
+  geom_boxplot(width=0.7, outlier.colour = 'red')+
+  xlab("year")+
+  facet_wrap(~treatment2, ncol = 3)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, size = 6), legend.position = "bottom")+
+   guides(fill = guide_legend(nrow = 5))
+```
+In order to identify individual outliers lets group the trial data using source, year, treatment, long and lat. To facilitate this let's create a trial_id for the data using these columns.
+```{r}
+maize_filtered <- maize_filtered |> dplyr::mutate(trial_id = paste(longitude, latitude, dataset_id, date, treatment2, sep = "_"))
+```
+
+
+Let's see the unique length of the combination of the fields using for creating trial id
+```{r}
+length(unique(maize_filtered$trial_id))
+```
+
+There are different types of outlier detection method. For this data we used Tukey’s fences which is a technique used in box plots. The non-outlier range is defined with [Q1−k(Q3−Q1), Q3+k(Q3−Q1)], where Q1 and Q3 are the lower and upper quartiles respectively, k - some non-negative constant (popular choice is 1.5).
+```{r}
+  unq_trial_id <- unique(maize_filtered$trial_id)
+  outlier <- data.frame()
+  for(j in 1:length(unq_trial_id)){
+    df2 <- maize_filtered |> dplyr::filter(trial_id == unq_trial_id[j])
+    q1 <- quantile(df2$yield, .25, na.rm = TRUE)
+    q3 <- quantile(df2$yield, .75, na.rm = TRUE)
+    iqr <- IQR(df2$yield,  na.rm = TRUE)
+    o <- df2 |> filter(yield < (q1 - 1.5*iqr) | yield > (q3 + 1.5*iqr))
+  outlier <- rbind(outlier, o)
+  }
+  dim(outlier)
+```
+Lets group these outliers by source.
+
+```{r}
+outlier |> dplyr::group_by(dataset_id) |>
+  dplyr::summarise(n = n()) |> arrange(desc(n))
+```
+
+Let's flag these outliers
+```{r}
+flag6 <- outlier |> select(-c(trial_id))
+flag6$comment <- "yield outliers"
+flag6$description <- "yield outliers treated based on source, season, treatment & geolocation"
+```
+
+Let's filter out the above outliers and have the final data
+```{r}
+maize_filtered <- maize_filtered |> dplyr::filter(!(unique_id %in% flag6$unique_id))
+maize_filtered<-maize_filtered %>% drop_na(yield, date, longitude, latitude, N_fertilizer, P_fertilizer, K_fertilizer )
+dim(maize_filtered)
+```
+The final data flagged
+```{r}
+flag1 <- flag1 |> dplyr::mutate(n_rate2 = round_any(N_fertilizer, 5), p_rate2 = round_any(P_fertilizer, 10), k_rate2 = round_any(K_fertilizer, 5))
+flag1 <- flag1 |> dplyr::mutate(treatment2 = paste(n_rate2, p_rate2, k_rate2, sep = "_"))
+cols <- c("n_rate2", "p_rate2", "k_rate2", "treatment2")
+for(i in 1:length(cols)){
+  flag1 <- flag1 |> dplyr::relocate(cols[i], .before = comment)
+}
+final_flag <-  flag1 |> dplyr::bind_rows(flag2, flag3, flag4, flag5, flag6)
+dim(final_flag)
+```
+
+Now let's see the final filtered  data by region
+```{r}
+final_pts_filtered <- st_as_sf(maize_filtered, coords = c("longitude", "latitude"), crs = "EPSG:4326")
+final_pts_filtered <- st_join(NGA_reg, final_pts_filtered)
+```
+
+Plot the final filtered data
+```{r fig.width=10}
+final_pts_filtered |> ggplot(aes(NAME_1))+
+  geom_bar(fill = "lightblue")+
+  xlab("region")+
+  ylab("observation")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12))
+```
+Exporting final filtered data with needed colomun to drive
+
+```{r}
+maize_filtered<-maize_filtered %>% select(unique_id,dataset_id,trial_id,country,site,reference,longitude,latitude,elevation,date,yield, n_rate2,p_rate2 ,k_rate2,treatment2)
+
+writexl::write_xlsx(df, paste(pathIn_trial, 'final_pts_filtered.xlsx',sep = "/"),col_names = TRUE,
+                      format_headers = TRUE,
+                      use_zip64 = FALSE)
+
+```
