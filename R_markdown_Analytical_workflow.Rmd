@@ -1,0 +1,702 @@
+---
+title: "Executing Analytical worklow"
+author: "Degefie Tibebe"
+date: "6/7/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### 1. install and Load required packages
+
+```{r, message=FALSE}
+#install & load packages
+  packages_required <- c("terra", "tidyverse", "sf", "spData","ggspatial","lubridate", "plyr","geodata","klippy","rosm", "prettymapr","plyr","reader", "writexl")
+
+#check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  invisible(lapply(packages_required, library, character.only = TRUE))
+```
+
+```{r}
+rm(list = ls())
+```
+
+```{r klippy, echo = FALSE, include = TRUE}
+klippy::klippy(position = c('top', 'right'), color = 'darkred', tooltip_message = 'Click to copy', tooltip_success = 'Done')
+
+```
+
+### 2.define functions to get spatial data (covraite data)
+a. Climate data
+```{r}
+#' Function to  access raster monthly climate data (precipitation, Tmax, Tmin, Solar radtion
+#' Relative humidity) from online sources and extract using field trial data to prepare for data driven modelling.
+#' Further prepare scenario rasters (Above, Normal and Below) for prediction 
+#' 
+getSpatialClimate <- function(climate, useCaseName){
+  
+  # install & load packages
+  packages_required <- c("terra", "tidyverse", "sf", "lubridate", "plyr","geodata")
+  # check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  invisible(lapply(packages_required, library, character.only = TRUE))
+  
+  # read trial sample data
+  
+  pathIn_trial <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                        useCaseName, "input/field_data", sep = "/")
+ 
+  
+  trial <- readxl::read_xlsx(paste(pathIn_trial, "final_pts_filtered.xlsx", sep = "/"), 
+                             col_names = T) 
+  
+  
+  
+  points <- vect(trial, geom = c("longitude", "latitude"), crs = "epsg:4326")
+  
+  specialnames <- setdiff(names(trial), c("longitude", "latitude","date"))
+  
+  
+  # working on the sowing start and growing length by the trial points data
+  
+  trial<-trial %>% mutate(sowing_start = 121)
+  
+  trial<-trial %>% mutate(grow_length = 120)
+  
+  trial_with_grow_len <- trial |> 
+    dplyr::mutate(full_date = as.Date(paste(date, "01", "01", sep = "-"))) |>
+    dplyr::mutate(pl_date = ymd(full_date) + days(sowing_start)) |>
+    dplyr::mutate(hv_date = ymd(full_date) + days(sowing_start+grow_length))|>na.omit() 
+  
+  
+  # read the climate monthly data from different directories
+  
+  if(climate == "precipitation"){
+    ras <- worldclim_country(useCaseName, var="prec", path=tempdir())
+  }else if(climate == "tempMax"){
+      ras <- worldclim_country(useCaseName, var="tmin", path=tempdir())
+  }else if(climate == "tempMin"){
+      ras <- worldclim_country(useCaseName, var="tmax", path=tempdir())
+  }else if(climate == "solaRadiation"){
+       ras <- worldclim_country(useCaseName, var="srad", path=tempdir())
+  }else if(climate == "relativeHumidity"){
+       ras <- worldclim_country(useCaseName, var="srad", path=tempdir())
+  }else{
+      print("Please enter a valid climate variable name")
+  }
+  
+  
+  unique_grow_len <- trial_with_grow_len |> dplyr::select(date, pl_date, hv_date) |>
+    unique()
+  
+  # loop unique planting and harvesting date to extract the climate data
+  f_df <- c()
+  for(i in 1:nrow(unique_grow_len)){
+    print(i)
+    d <- trial_with_grow_len |> dplyr::filter(pl_date == unique_grow_len$pl_date[i] & 
+                                                hv_date == unique_grow_len$hv_date[i])
+    pl_date <- d$pl_date[1]
+    hv_date <- d$hv_date[1]
+    year <- d$date[1]
+    d <- vect(d, geom = c("longitude", "latitude"), crs = "epsg:4326")
+    if(pl_date < hv_date){
+      month_start <- as.numeric(format(pl_date, "%m"))
+      month_end <- as.numeric(format(hv_date, "%m"))
+      grow_len_r <- ras[[month_start:month_end]]
+    }else if(pl_date > hv_date){
+      month_start <- as.numeric(format(pl_date, "%m"))
+      month_end <- as.numeric(format(hv_date, "%m"))
+      
+      grow_len_r1 <- ras[[month_start:12]]
+      grow_len_r2 <- ras[[13:month_end + 12]]
+      grow_len_r <- c(grow_len_r1, grow_len_r2)
+    }
+    r_df <- terra::extract(grow_len_r, d) |> dplyr::select(-ID)
+    colnames(r_df) <- paste0(climate, "_g_len_", seq(1,ncol(r_df),1))
+    f_df <- rbind.fill(f_df, r_df) # row binds df with different column numbers
+  }
+  
+  
+ 
+    # fill na values with row means - with different growing lengths some areas have 3,
+    # others have 4, others have 5. The shorter ones have NA values to match the larger
+    # ones. The NA values will be filled by row means
+    
+    # k <- which(is.na(f_df), arr.ind = TRUE)
+    # f_df[k] <- rowMeans(f_df, na.rm = TRUE)[k[, 1]]
+    
+    final_df <- trial_with_grow_len |> dplyr::select(unique_id, longitude, latitude, date, pl_date, hv_date) |>
+      cbind(f_df)
+   
+    
+    # ----------------------------------------------------------------------------
+    # create a prediction scenario raster
+    min_pl_date <- min(format(as.Date(final_df$pl_date,format="%d/%m/%Y"),"%m")) |>
+      as.numeric()
+    max_hv_date <- max(format(as.Date(final_df$hv_date,format="%d/%m/%Y"),"%m")) |>
+      as.numeric()
+    clim_rast <- ras
+    
+    q2_clim <- rast()
+    q1_clim <- rast()
+    q3_clim <- rast()
+    
+    
+      q1 <- terra::quantile(clim_rast, probs = 0.25)
+      add(q1_clim) <- q1
+      q2 <- terra::quantile(clim_rast, probs = 0.5)
+      add(q2_clim) <- q2
+      q3 <- terra::quantile(clim_rast, probs = 0.75)
+      add(q3_clim) <- q3
+    
+    
+    clim_below <- q1_clim
+    clim_normal <- q2_clim
+    clim_above <- q3_clim
+    names(clim_above) <- names(clim_normal) <- names(clim_above) <-
+      paste0(climate, "_g_len_", seq(1,nlyr(clim_below),1))
+   
+    # export the results to the crop path  
+    pathOut_gps <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                         useCaseName, "intermediate/gps", sep = "/")
+    
+    if(!dir.exists(pathOut_gps)){
+      suppressWarnings(dir.create(pathOut_gps, recursive = T))
+    }
+    
+    pathOut_layers <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                            useCaseName, "intermediate/geospatial/climate", sep = "/")
+    
+    if(!dir.exists(pathOut_layers)){
+      suppressWarnings(dir.create(pathOut_layers, recursive = T))
+    }
+    
+    final_df <- final_df |> dplyr::select(-c(hv_date, pl_date))
+    saveRDS(final_df, paste(pathOut_gps, paste0(climate, ".rds"), sep = "/"))
+    
+    terra::writeRaster(
+      clim_above,
+      filename = paste(pathOut_layers,paste0(climate, "_above", ".tif"), sep = "/"),
+      filetype = "GTiff",
+      overwrite = T
+    )
+    terra::writeRaster(
+      clim_normal,
+      filename = paste(pathOut_layers,paste0(climate, "_normal", ".tif"), sep = "/"),
+      filetype = "GTiff",
+      overwrite = T
+    )
+    terra::writeRaster(
+      clim_below,
+      filename = paste(pathOut_layers,paste0(climate, "_below", ".tif"), sep = "/"),
+      filetype = "GTiff",
+      overwrite = T
+    )
+  }
+  
+    
+     
+    
+
+```
+b. Get soil data
+```{r}
+# ------------------------------------------------------------------------------
+#'Function to get soil nuitrient covariates from ISDA soil profile data and extract 
+#'using field trial data to prepare for data driven modelling work
+# ------------------------------------------------------------------------------ 
+
+getSpatialSoil <- function(useCaseName){
+  
+  packages_required <- c("terra", "sf", "geodata", "tidyverse", "readxl","AOI")
+  
+  # check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  invisible(lapply(packages_required, library, character.only = TRUE))
+  
+  # read soil properities data from ISDA soil at 0-20 cm depth (e.g Soil organic carbon (OC), Bulk density (BLKD), pH, total nitrogen (Ntot), Extractable potassium)
+  
+   OC <- soil_af_isda(var="OC", depth=20, path=tempdir())
+   BLKD <- soil_af_isda(var="db.od", depth=20, path=tempdir())
+   pH <- soil_af_isda(var="pH.H2O", depth=20, path=tempdir())
+   Ntot <- soil_af_isda(var="N.tot", depth=20, path=tempdir())
+   P <- soil_af_isda(var="P", depth=20, path=tempdir())
+   K <- soil_af_isda(var="K", depth=20, path=tempdir())
+  
+  
+  #Cropping by country boundary 
+  crop_mask = aoi_get(country = useCaseName)
+  
+  OC1 <-crop(OC,crop_mask,mask=T)
+  BLKD1 <-crop(BLKD,crop_mask,mask=T)
+  pH1 <-crop(pH,crop_mask,mask=T)
+  Ntot1 <-crop(Ntot,crop_mask,mask=T)
+  P1 <-crop(P,crop_mask,mask=T)
+  K1 <-crop(K,crop_mask,mask=T)
+ 
+  #concatenate all soil property layer
+  soil<-c(OC1,BLKD1,pH1,Ntot1,P1,K1)
+  
+  pathOut_layers <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                          useCaseName, "intermediate/geospatial/soil", sep = "/")
+  
+  if(!dir.exists(pathOut_layers)){
+    suppressWarnings(dir.create(pathOut_layers, recursive = T))
+  }
+  
+  
+  # read the trial data and extract the soil data
+  pathIn_trial <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                        useCaseName, "input/field_data", sep = "/")
+  trial <- readxl::read_xlsx(paste(pathIn_trial, "final_pts_filtered.xlsx", sep = "/"), 
+                             col_names = T)
+  
+  points <- terra::vect(trial, geom = c("longitude", "latitude"), crs = "epsg:4326")
+  
+  points_soil <- soil |> terra::extract(points) |> select(-(ID))
+  extracted_soil <- trial |> dplyr::select(unique_id, longitude, latitude, date) |> cbind(points_soil)
+  
+  # export the results to intermediate path  
+  pathOut_gps <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                       useCaseName, "intermediate/gps", sep = "/")
+  if(!dir.exists(pathOut_gps)){
+    suppressWarnings(dir.create(pathOut_gps, recursive = T))
+  }
+  pathOut_layers <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                          useCaseName, "intermediate/geospatial/soil", sep = "/")
+  if(!dir.exists(pathOut_layers)){
+    suppressWarnings(dir.create(pathOut_layers, recursive = T))
+  }
+  
+  saveRDS(extracted_soil, paste(pathOut_gps, "soil.rds", sep = "/"))
+  terra::writeRaster(
+    OC1,
+    filename = paste(pathOut_layers,"OC.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    BLKD1,
+    filename = paste(pathOut_layers,"BLKD.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    pH1,
+    filename = paste(pathOut_layers,"pH.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    Ntot1,
+    filename = paste(pathOut_layers,"Ntot.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    P1,
+    filename = paste(pathOut_layers,"P.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    K1,
+    filename = paste(pathOut_layers,"K.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+}
+
+
+```
+c. Get topograpy data
+```{r}
+# ------------------------------------------------------------------------------
+#' Function to get elvation and derived vraibles like slope, tri and tpi and extracting
+#' using field trial data to prepare for data driven modelling
+# ------------------------------------------------------------------------------ 
+getSpatialTopography <- function(useCaseName){
+  
+  packages_required <- c("terra", "sf", "geodata", "tidyverse", "readxl","rgeoboundaries","raster","elevatr")
+  
+  # check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  invisible(lapply(packages_required, library, character.only = TRUE))
+  
+  # read the elevation data 
+  
+  #dem_o <- rgeoboundaries::geoboundaries(useCaseName)
+  dem<-elevation_30s(useCaseName, mask=TRUE,path=tempdir())
+  
+  # # derive slope and aspect mask the rasters with growing area of the crop 
+  # crop_mask <- crop_mask |> terra::resample(dem)
+  # dem <- dem |> terra::crop(crop_mask) |> terra::mask(crop_mask)
+   
+ 
+   slope <-terra::terrain(dem,"slope", neighbors=8)  
+   tpi <- terra::terrain(dem,'TPI', neighbors=8)
+   tri <- terra::terrain(dem,'TRI', neighbors=8)
+   
+  topo<-c(dem,slope,tpi,tri)
+  
+  # read the trial data and extract the topography data
+  pathIn_trial <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                        useCaseName, "input/field_data", sep = "/")
+  
+  trial <- readxl::read_xlsx(paste(pathIn_trial, "final_pts_filtered.xlsx", sep = "/"), 
+                             col_names = T)  
+  points <- terra::vect(trial, geom = c("longitude", "latitude"), crs = "epsg:4326")
+  
+  
+  points_topo <- topo |> terra::extract(points)
+  points_topo = subset(points_topo, select = -(ID))
+  extracted_topo <- trial |> dplyr::select(unique_id, longitude, latitude, date) |> cbind(points_topo)
+  
+    # export the results to intermediate path  
+  pathOut_gps <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                       useCaseName, "intermediate/gps", sep = "/")
+  if(!dir.exists(pathOut_gps)){
+    suppressWarnings(dir.create(pathOut_gps, recursive = T))
+  }
+  pathOut_layers <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                          useCaseName, "intermediate/geospatial/topography", sep = "/")
+  if(!dir.exists(pathOut_layers)){
+    suppressWarnings(dir.create(pathOut_layers, recursive = T))
+  }
+  
+  saveRDS(extracted_topo, paste(pathOut_gps, "topography.rds", sep = "/"))
+  terra::writeRaster(
+    dem,
+    filename = paste(pathOut_layers,"dem.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    slope,
+    filename = paste(pathOut_layers,"slope.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+
+}
+```
+3. Aggregate all spatial data and creating anlysis ready data
+```{r}
+#' -----------------------------------------------------------------------------
+#' Using functions get analysis ready data on soil, topography and 
+#' climate and combine with  field trial points to prepare for data driven analysis.
+#'  Further prepare prediction grid with three scenarios (above, ormal and below)for fertilizer prediction
+#' -----------------------------------------------------------------------------
+
+getAnalysisReadyData <- function(useCaseName){
+ 
+   packages_required <- c("terra", "sf", "tidyverse", "readxl")
+  
+  # check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  invisible(lapply(packages_required, library, character.only = TRUE))
+  
+  # list all the climate variables
+  climate = c("precipitation", "tempMax", "tempMin", "solaRadiation", "relativeHumidity")
+  
+  # source the soil, topography, climate and lime scripts 
+  source("~/Ferilizer_prediction/Scripts/getSpatialSoil.R")
+  source("~/Ferilizer_prediction/Scripts/getSpatialTopography.R")
+  source("~/Ferilizer_prediction/Scripts/getSpatialClimate.R")
+  
+  getSpatialSoil(useCaseName)
+  getSpatialTopography(useCaseName)
+  
+  # loop through each climate variables to extract using gps to create climate 
+  # scenario 
+  for(i in 1:length(climate)){
+    getSpatialClimate(climate[i], useCaseName)
+  }
+  
+  # ------------------------------------------------------------------------------
+  # bind all the rds files with the trial data and make the data ready for the 
+  # data driven approach
+  pathIn_trial <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                        useCaseName, "input/field_data", sep = "/")
+  trial <- readxl::read_xlsx(paste(pathIn_trial, "final_pts_filtered.xlsx", sep = "/"), 
+                             col_names = T)
+  
+  pathIn_gps<- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                     useCaseName, "intermediate/gps", sep = "/")
+  rds_files <- list.files(path = pathIn_gps, pattern = "*.rds", full.names = T)
+  
+  for(i in 1:length(rds_files)){
+    rds <- readRDS(rds_files[i])
+    trial <- trial |> dplyr::inner_join(rds, by = c("unique_id" = "unique_id"))
+  }
+  # prepare the final prediction raster for three different scenarios
+  pathIn_Soil <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                       useCaseName, "intermediate/geospatial/soil", sep = "/")
+  pathIn_Topo <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                       useCaseName, "intermediate/geospatial/topography", sep = "/")
+  pathIn_climate <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                          useCaseName, "intermediate/geospatial/climate", sep = "/")
+  
+  soil_sp <- list.files(path = pathIn_Soil, pattern = "*.tif", full.names = T)|> 
+    rast() 
+  
+ 
+  soil_lyr <- c(soil_sp)
+  
+  topo_sp <- list.files(path = pathIn_Topo, pattern = "*.tif", full.names = T) |> 
+    rast() 
+  topo_lyr <- c(topo_sp) |> terra::resample(soil_lyr)
+  
+  # read the climates of three different scenarios
+  # above scenario
+  climate_sp_abv <- list.files(path = pathIn_climate, pattern = "*above.tif", full.names = T)
+  climate_lyr_abv <- rast()
+  for(i in 1:length(climate_sp_abv)){
+    print(i)
+    r <- terra::rast(climate_sp_abv[[i]]) |> terra::resample(soil_lyr)
+    add(climate_lyr_abv) <- r
+  }
+  
+  # normal scenario
+  climate_sp_norm <- list.files(path = pathIn_climate, pattern = "*normal.tif", full.names = T)
+  climate_lyr_norm <- rast()
+  for(i in 1:length(climate_sp_norm)){
+    print(i)
+    r <- terra::rast(climate_sp_norm[[i]]) |> terra::resample(soil_lyr[[1]])
+    add(climate_lyr_norm) <- r
+  }
+  
+  # below scenario
+  climate_sp_bel <- list.files(path = pathIn_climate, pattern = "*below.tif", full.names = T)
+  climate_lyr_bel <- rast()
+  for(i in 1:length(climate_sp_bel)){
+    print(i)
+    r <- terra::rast(climate_sp_bel[[i]]) |> terra::resample(soil_lyr[[1]])
+    add(climate_lyr_bel) <- r
+  }
+  
+  # create a prediction grid for all scenarios including soil and topography
+  scenario_above <- c(topo_lyr, soil_lyr, climate_lyr_abv)
+  scenario_normal <- c(topo_lyr, soil_lyr, climate_lyr_norm)
+  scenario_below <- c(topo_lyr, soil_lyr,  climate_lyr_bel)
+  
+  # write the final outputs of data frame and prediction layers for ML
+  pathOut_Final <- paste("~/Ferilizer_prediction/dataops/datasourcing/Data", 
+                         useCaseName, "output", sep = "/")
+  if(!exists(pathOut_Final)){
+    suppressWarnings(dir.create(pathOut_Final, recursive = T))
+  }
+  saveRDS(trial, paste(pathOut_Final, "covariates_GPS_ML2.rds", sep = "/"))
+  
+  terra::writeRaster(
+    scenario_above,
+    filename = paste(pathOut_Final,"scenario_above.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    scenario_normal,
+    filename = paste(pathOut_Final,"scenario_normal.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+  terra::writeRaster(
+    scenario_below,
+    filename = paste(pathOut_Final,"scenario_below.tif", sep = "/"),
+    filetype = "GTiff",
+    overwrite = T
+  )
+}
+
+
+
+```
+4. train and validate model
+```{r}
+#' Developing Random forest ML model for  response curve for N_rate, P_rate and K_rate
+#' to yield. It uses the anlayis ready data as an input and trai RF model
+
+
+RF_ML <- function(useCaseName){
+  
+  # 1. Sourcing required packages -------------------------------------------
+  
+  packages_required <- c("doParallel", "foreach", "h2o", "tidyverse", "dplyr", "stringr", "ggplot2", "ggpmisc", "Metrics")
+  
+  # check and install packages that are not yet installed
+  installed_packages <- packages_required %in% rownames(installed.packages())
+  if(any(installed_packages == FALSE)){
+    install.packages(packages_required[!installed_packages])}
+  
+  # load required packages
+  suppressWarnings(suppressPackageStartupMessages(invisible(lapply(packages_required, library, character.only = TRUE))))
+  
+  #  data accesing for model input 
+  
+  ML_inputData <- readRDS(paste("~/Ferilizer_prediction/dataops/datasourcing/Data", useCaseName, "output", "covariates_GPS_ML2.rds", sep="/")) 
+  
+  
+  # setting up a local h2o cluster
+  h2o.init()
+  
+  # convert our dataframe into a special object that h2o can recognize
+  ML_inputData.h2o <- as.h2o(ML_inputData)
+  
+  
+  #create a random training-test split of our data
+  ML_inputData.h2o <- as.h2o(ML_inputData)
+  ML_inputData_split <- h2o.splitFrame(data = ML_inputData.h2o, ratios = 0.8, seed = 1234)
+  training_data <- ML_inputData_split[[1]]
+  test_data <- ML_inputData_split[[2]]
+  
+  
+  ## define the target and feature variables
+  listVars=NULL
+  if(!is.null(listVars)){
+    predictors <- listVars
+  }else{
+    predictors <- c("n_rate2","p_rate2", "k_rate2", "n.tot.ncs_0-20cm", "p_0-20cm", "k_0-20cm", "oc_0-20cm", "precipitation_g_len_1", "precipitation_g_len_2", "precipitation_g_len_3", "precipitation_g_len_4",  
+                    "tempMax_g_len_1", "tempMax_g_len_2","tempMax_g_len_3", "tempMax_g_len_4","tempMin_g_len_1", "tempMin_g_len_2","tempMin_g_len_3", "tempMin_g_len_4",
+                    "solaRadiation_g_len_1", "solaRadiation_g_len_2", "solaRadiation_g_len_3", "solaRadiation_g_len_4","relativeHumidity_g_len_1","relativeHumidity_g_len_2","relativeHumidity_g_len_3","relativeHumidity_g_len_4","dem","slope", "TPI", "TRI", "db.od_0-20cm", "ph.h2o_0-20cm")
+  }
+  
+  response <- "yield"
+  #response2 <- "yield2"
+  
+  
+  ## Specify the hyper-parameter grid
+  hyper_params <- list(
+    ntrees = seq(500, 1200, 100),
+    max_depth = seq(4, 12, 2),
+    mtries = c(2, 3, 4, 5, 6)
+  )
+  
+  # Train and tune the random forest model
+  grid_rf <- h2o.grid(
+    algorithm = "randomForest",
+    x = predictors,
+    y = response,
+    grid_id = "rf_grid",
+    hyper_params = hyper_params,
+    training_frame = training_data,
+    validation_frame = test_data,
+    seed = 444
+  )
+  
+  
+  pathOut <- paste("~/Ferilizer_prediction/ML_output",useCaseName, "output", sep = "/")
+  if(!exists(pathOut)){
+    suppressWarnings(dir.create(pathOut, recursive = T))
+  }
+  
+  saveRDS(grid_rf, paste(pathOut, "grid_rf_hyperParam.rds", sep=""))
+  # Get the best model from the grid search
+  best_model <- h2o.getModel(grid_rf@model_ids[[1]])
+  
+  ML_randomForest <- h2o.randomForest(x = predictors,
+                                      y = response,
+                                      ntrees =  best_model@parameters$ntrees,
+                                      max_depth = best_model@parameters$max_depth,
+                                      mtries =   best_model@parameters$mtries,
+                                      training_frame = training_data,
+                                      validation_frame = test_data,
+                                      keep_cross_validation_predictions = TRUE,
+                                      nfolds = 5,
+                                      seed = 444)
+  
+  model_path <- h2o.saveModel(object = ML_randomForest, path = pathOut, force = TRUE)
+  saved_model <- h2o.loadModel(model_path)
+  
+  rmse_r2_randomforest <- data.frame( mae = round(h2o.mae(ML_randomForest, train=TRUE, valid=TRUE), 0),
+                                      rmse =h2o.rmse(ML_randomForest, train=TRUE, valid=TRUE)[[2]],
+                                      R_sq = c(h2o.r2(ML_randomForest, train=TRUE, valid=TRUE)[[2]]))
+  saveRDS(rmse_r2_randomforest, paste(pathOut, "rmse_r2_randomforest.RDS"))
+  
+  rmse_r2_randomforest
+  
+  print("Model performance evaluation plots")
+  
+  print("1. residual plot)")
+  h2o.residual_analysis_plot(ML_randomForest,test_data)
+  
+  print("2. variable importance plot)")
+  h2o.varimp_plot(ML_randomForest)
+  
+  print("3. shap summary")
+  h2o.shap_summary_plot(ML_randomForest, test_data)
+  
+  print("4. partial plot")
+  h2o.partialPlot(object = ML_randomForest, newdata = test_data, cols = "n_rate2")
+  h2o.partialPlot(object = ML_randomForest, newdata = test_data, cols = "p_rate2")
+  h2o.partialPlot(object = ML_randomForest, newdata = test_data, cols = "n_rate2")
+  
+  h2o.ice_plot(ML_randomForest,test_data,column = "n_rate2")
+  h2o.ice_plot(ML_randomForest,test_data,column = "p_rate2")
+  h2o.ice_plot(ML_randomForest,test_data,column = "k_rate2")
+  
+  print("5. validating by prediction")
+  rf_valid <- test_data
+  rf_valid$predResponse <- h2o.predict(object = ML_randomForest, newdata = test_data)
+  rf_valid <- as.data.frame(rf_valid)
+  rf_valid$Response <- rf_valid[,which(names(rf_valid)==response)]
+  
+  gg2 <-  ggplot(rf_valid, aes(Response, predResponse)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, color = "blue") +
+    xlab("Measured Yield") + ylab("predicted yield")+
+    ggtitle("Random forest") +
+    theme_bw()+
+    theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(size=12))
+  
+  ggsave(paste(pathOut, "randomForest_Validation.pdf", sep=""), gg2)
+  
+  print(gg2)
+  
+ 
+  h2o.residual_analysis_plot(ML_randomForest,test_data)
+  h2o.varimp_plot(ML_randomForest)
+  h2o.shap_explain_row_plot(ML_randomForest,test_data,row_index = 1)
+  h2o.shap_summary_plot(ML_randomForest,test_data)
+  h2o.pd_plot(ML_randomForest,test_data,column = "n_rate2")
+  h2o.ice_plot(ML_randomForest,test_data,column = "n_rate2")
+  
+   return(ML_randomForest)
+  
+}
+
+```
+5. Setting parameters, executing function and running ML model
+```{r}
+useCaseName <- "Nigeria"
+climate = c("precipitation", "tempMax", "tempMin", "solaRadiation", "relativeHumidity")
+source("~/Ferilizer_prediction/Scripts/getSpatialSoil.R")
+source("~/Ferilizer_prediction/Scripts/getSpatialTopography.R")
+source("~/Ferilizer_prediction/Scripts/getSpatialClimate.R")
+
+getSpatialTopography(useCaseName)
+getSpatialSoil(useCaseName)
+getSpatialClimate (climate, useCaseName)
+run_RF_ML(useCaseName)
+```
